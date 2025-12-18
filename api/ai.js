@@ -16,57 +16,85 @@ module.exports = async (req, res) => {
       return;
     }
 
-    const apiKey = process.env.OPENAI_API_KEY;
+    // ✅ DeepSeek Key（你现在 Vercel 配的是这个）
+    const apiKey = process.env.DEEPSEEK_API_KEY;
     if (!apiKey) {
-      // 不要把密钥写前端；密钥应在服务端环境变量中配置。:contentReference[oaicite:1]{index=1}
-      res.status(500).json({ error: "Server misconfigured: OPENAI_API_KEY is missing" });
+      res.status(500).json({
+        error: "Server misconfigured: DEEPSEEK_API_KEY is missing (请在 Vercel 环境变量中设置 DEEPSEEK_API_KEY)"
+      });
       return;
     }
 
-    const model = process.env.OPENAI_MODEL || "gpt-5";
+    // DeepSeek Base URL（默认官方）
+    const baseUrl = (process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com").replace(/\/$/, "");
+    const endpoint = `${baseUrl}/chat/completions`;
+
+    // 默认模型：deepseek-chat（更稳定输出 JSON）
+    const model = process.env.DEEPSEEK_MODEL || "deepseek-chat";
+
+    // 输出 token 上限（按需调大/调小）
+    const maxTokens = Number(process.env.DEEPSEEK_MAX_TOKENS || 2200);
+
+    // 超时控制
+    const controller = new AbortController();
+    const timeoutMs = Number(process.env.DEEPSEEK_TIMEOUT_MS || 45000);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     const payload = {
       model,
-      // 兼容写法：input 直接传 message 数组（system/user/assistant）
-      input: messages,
-      // 建议不存储（按需）
-      store: false,
+      messages,
+      stream: false,
       temperature: 0.2,
-      max_output_tokens: 1600
+      max_tokens: maxTokens,
+
+      // ✅ 强制 JSON 输出（减少“不是合法JSON”导致的前端回填失败）
+      // 注意：你仍然要在 system/user prompt 里要求输出 JSON（前端已写）
+      response_format: { type: "json_object" }
     };
 
-    const r = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(payload),
-    });
+    try {
+      const r = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
 
-    const data = await r.json();
+      const data = await r.json().catch(() => null);
 
-    if (!r.ok) {
-      // 把 OpenAI 的错误透出（便于前端显示“AI评估失败…”）
-      res.status(r.status).json({ error: data?.error?.message || JSON.stringify(data) });
-      return;
-    }
-
-    // 从 Responses 结构里抽取 output_text
-    const output = Array.isArray(data.output) ? data.output : [];
-    const texts = [];
-    for (const item of output) {
-      const content = Array.isArray(item.content) ? item.content : [];
-      for (const c of content) {
-        if (c && c.type === "output_text" && typeof c.text === "string") {
-          texts.push(c.text);
-        }
+      if (!r.ok) {
+        const msg =
+          data?.error?.message ||
+          data?.message ||
+          JSON.stringify(data) ||
+          `HTTP ${r.status}`;
+        res.status(r.status).json({ error: msg });
+        return;
       }
-    }
-    const content = texts.join("\n").trim();
 
-    res.status(200).json({ content, meta: meta || null, model: data.model || model });
+      const content = data?.choices?.[0]?.message?.content;
+      if (typeof content !== "string" || !content.trim()) {
+        res.status(500).json({ error: "DeepSeek returned empty content" });
+        return;
+      }
+
+      res.status(200).json({
+        content,
+        meta: meta || null,
+        provider: "deepseek",
+        model: data?.model || model
+      });
+    } finally {
+      clearTimeout(timer);
+    }
   } catch (err) {
-    res.status(500).json({ error: err?.message || String(err) });
+    const msg =
+      err?.name === "AbortError"
+        ? "Request timed out (DEEPSEEK_TIMEOUT_MS)"
+        : (err?.message || String(err));
+    res.status(500).json({ error: msg });
   }
 };
